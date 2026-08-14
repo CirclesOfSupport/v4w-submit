@@ -177,6 +177,15 @@ def submit_to_v4w(fields_values: dict) -> dict:
 
     form_data_json = build_form_data(fields_values)
 
+    # PII-safe request marker: never log the full phone (veteran PII). Last 4
+    # is enough to correlate a run with the TextIt httplog / a V4W record.
+    phone = fields_values.get("phone", "")
+    phone_tail = phone[-4:] if len(phone) >= 4 else phone
+    logger.info("V4W submit start: name=%s %s zip=%s phone=...%s gender=%s branch=%s",
+                fields_values.get("fname"), fields_values.get("lname"),
+                fields_values.get("zip"), phone_tail,
+                fields_values.get("gender"), fields_values.get("branch"))
+
     # POST 1: intentionally invalid nonce to trigger the JiT nonce response.
     p1, r1 = _nf_post(form_data_json, security="0", nonce_ts=None)
 
@@ -197,6 +206,7 @@ def submit_to_v4w(fields_values: dict) -> dict:
 
     new_nonce = nonce_block["new_nonce"]
     nonce_ts = str(nonce_block.get("nonce_ts", ""))
+    logger.info("V4W POST1 returned JiT nonce (ts=%s); retrying", nonce_ts)
 
     # POST 2: resubmit with the JiT nonce.
     p2, r2 = _nf_post(form_data_json, security=new_nonce, nonce_ts=nonce_ts)
@@ -207,6 +217,7 @@ def submit_to_v4w(fields_values: dict) -> dict:
 
     sub_id = _extract_sub_id(p2)
     if sub_id:
+        logger.info("V4W submit success: sub_id=%s (POST2)", sub_id)
         return {"success": True, "sub_id": str(sub_id), "detail": "created on POST2"}
 
     # Still no sub_id: surface whatever NF said (field errors, nonce loop, etc.)
