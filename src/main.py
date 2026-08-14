@@ -144,6 +144,13 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
         parsed = resp.json()
     except ValueError:
         parsed = None
+        # Non-JSON response (e.g. a WAF/bot-protection HTML block page). Log the
+        # status + a snippet of the body so the blocker is identifiable
+        # (Wordfence, Cloudflare "Access Denied" + ray id, etc.) without needing
+        # another live submission to reproduce. Body is V4W's, not subscriber PII.
+        snippet = (resp.text or "")[:300].replace("\n", " ")
+        logger.warning("V4W non-JSON response: HTTP %s | body[:300]=%s",
+                       resp.status_code, snippet)
     return parsed, resp
 
 
