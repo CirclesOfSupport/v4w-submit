@@ -147,6 +147,28 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
     return parsed, resp
 
 
+def _extract_sub_id(parsed: dict):
+    """Pull data.actions.save.sub_id, tolerating NF's shape variation.
+
+    On a genuine success NF returns data as an OBJECT:
+      {"data":{"actions":{"save":{"sub_id":813796}}}, ...}
+    On the nonce-retry (and some error) responses NF returns data as an empty
+    LIST:  {"data":[], "errors":{...}}.  Calling .get() on that list raises
+    AttributeError, which is what produced the 500. Guard every hop: if any
+    level isn't a dict, there's no sub_id.
+    """
+    data = parsed.get("data")
+    if not isinstance(data, dict):
+        return None
+    actions = data.get("actions")
+    if not isinstance(actions, dict):
+        return None
+    save = actions.get("save")
+    if not isinstance(save, dict):
+        return None
+    return save.get("sub_id")
+
+
 def submit_to_v4w(fields_values: dict) -> dict:
     """Full two-POST JiT-nonce submission. Returns a normalized result dict:
       {"success": bool, "sub_id": <str|None>, "detail": <str>}
@@ -163,7 +185,7 @@ def submit_to_v4w(fields_values: dict) -> dict:
                 "detail": f"POST1 non-JSON response (HTTP {r1.status_code})"}
 
     # If POST1 somehow already succeeded (nonce happened to validate), take it.
-    sub_id = (p1.get("data", {}).get("actions", {}).get("save", {}) or {}).get("sub_id")
+    sub_id = _extract_sub_id(p1)
     if sub_id:
         return {"success": True, "sub_id": str(sub_id), "detail": "created on POST1"}
 
@@ -183,7 +205,7 @@ def submit_to_v4w(fields_values: dict) -> dict:
         return {"success": False, "sub_id": None,
                 "detail": f"POST2 non-JSON response (HTTP {r2.status_code})"}
 
-    sub_id = (p2.get("data", {}).get("actions", {}).get("save", {}) or {}).get("sub_id")
+    sub_id = _extract_sub_id(p2)
     if sub_id:
         return {"success": True, "sub_id": str(sub_id), "detail": "created on POST2"}
 
@@ -301,6 +323,10 @@ def submit():
         logger.exception("Transport error submitting to V4W")
         return jsonify({"status": "error", "success": False,
                         "message": f"V4W transport error: {e}"}), 502
+    except Exception as e:
+        logger.exception("Unexpected error submitting to V4W")
+        return jsonify({"status": "error", "success": False,
+                        "message": f"internal error: {e}"}), 500
 
     if not result["success"]:
         # Log loudly — this is the case that must be visible when it fails.
