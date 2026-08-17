@@ -251,22 +251,24 @@ def submit_to_v4w(fields_values: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 # Gender picklist on the V4W form. If the subscriber value doesn't match exactly,
-# NF stores raw text or nulls it. V4W's not-specified picklist option is
-# "Prefer not to disclose" (lowercase d) for BOTH gender and branch — this is the
-# safe default for anything absent or unrecognized. NOTE: "Unknown" is NOT a valid
-# option on the /eatalk-to-us/ form and would be rejected (invalid-option); the
-# safe default must be the exact picklist string below.
-GENDER_DEFAULT = "Prefer not to disclose"
-BRANCH_DEFAULT = "Prefer not to disclose"
+# CRITICAL: NF option VALUES differ from displayed LABELS. These are the exact
+# <option value="..."> strings extracted from the /eatalk-to-us/ dropdowns via
+# DevTools (2026-08-17) — NOT the visible labels. Using labels gets invalid-option
+# rejections. Notable divergences: gender not-disclose VALUE is "Prefer not to
+# Disclose" (capital D) though it displays lowercase; gender "Questioning" VALUE is
+# "Not sure what their gender identity is (Questioning)"; branch not-disclose VALUE
+# is "Unknown" (not the "Prefer not to disclose" label); duty not-disclose VALUE is
+# "Did not obtain".
+GENDER_DEFAULT = "Prefer not to Disclose"   # capital D — verified option VALUE
+BRANCH_DEFAULT = "Unknown"                  # verified option VALUE (label says "Prefer not to disclose")
+DUTY_DEFAULT = "Did not obtain"             # verified option VALUE
 
-# Exact V4W Service Branch dropdown options (from /eatalk-to-us/, 2026-08-17):
-#   Prefer not to disclose | Army | Navy | Air Force | Coast Guard |
-#   Army National Guard | Air National Guard | USMC | Space Force
 # Contact militarybranch is FREE TEXT; observed values are mixed-case and
-# underscore variants. Map a normalized key (lowercased, _/space collapsed) to the
-# exact option. Marine Corps -> USMC (V4W has no "Marine Corps"). Plain
-# "National Guard" has no exact V4W target (they split Army/Air) -> safe default.
-# Anything not in this map -> BRANCH_DEFAULT (strict).
+# underscore variants (Army/army, Air Force/air_force, Marine Corps/marine_corps,
+# etc.). Map a normalized key (lowercased, _/space collapsed) to the exact option
+# VALUE. Marine Corps -> USMC (V4W has no "Marine Corps"). Plain "National Guard"
+# has no exact V4W target (they split Army/Air) -> safe default. Unrecognized ->
+# BRANCH_DEFAULT (strict).
 _BRANCH_MAP = {
     "army": "Army",
     "navy": "Navy",
@@ -280,11 +282,9 @@ _BRANCH_MAP = {
     "space force": "Space Force",
 }
 
-# Exact V4W Gender dropdown options (from /eatalk-to-us/, 2026-08-17):
-#   Prefer not to disclose | Male | Female | Non-binary | Transgender female |
-#   Transgender male | Genderqueer | Questioning | Other
-# Contact gender is FREE TEXT. Strict mapping: only clean single-value matches
-# map; multi-values, corrupted, and unrecognized strings -> GENDER_DEFAULT.
+# Contact gender is FREE TEXT. Strict mapping to exact option VALUES: only clean
+# single-value matches map; multi-values (comma), corrupted, and unrecognized
+# strings -> GENDER_DEFAULT. Note "Questioning" maps to the long option value.
 _GENDER_MAP = {
     "male": "Male",
     "female": "Female",
@@ -293,7 +293,7 @@ _GENDER_MAP = {
     "transgender female": "Transgender female",
     "transgender male": "Transgender male",
     "genderqueer": "Genderqueer",
-    "questioning": "Questioning",
+    "questioning": "Not sure what their gender identity is (Questioning)",
     "other": "Other",
 }
 
