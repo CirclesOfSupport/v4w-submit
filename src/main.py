@@ -155,12 +155,24 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
     except ValueError:
         parsed = None
         # Non-JSON response (e.g. a WAF/bot-protection HTML block page). Log the
-        # status + a snippet of the body so the blocker is identifiable
-        # (Wordfence, Cloudflare "Access Denied" + ray id, etc.) without needing
-        # another live submission to reproduce. Body is V4W's, not subscriber PII.
-        snippet = (resp.text or "")[:300].replace("\n", " ")
-        logger.warning("V4W non-JSON response: HTTP %s | body[:300]=%s",
-                       resp.status_code, snippet)
+        # status + body so the blocker is identifiable (Cloudflare block pages
+        # carry a "Ray ID" that V4W's Cloudflare admin can look up to see which
+        # rule fired). 1500 chars is enough to reach the Ray ID / cf-ray marker
+        # which sits well below the truncated 300. Body is V4W's, not subscriber PII.
+        body_text = resp.text or ""
+        snippet = body_text[:1500].replace("\n", " ")
+        # Best-effort: pull the Cloudflare Ray ID out explicitly so it's greppable.
+        # CF Ray IDs are 16 hex chars. Match the label forms and the JS challenge
+        # (cRay) form; the full body is logged below regardless, so this is a
+        # convenience, not load-bearing.
+        ray = ""
+        m = (re.search(r"[Rr]ay ID:\s*(?:<[^>]*>\s*)*([0-9a-f]{16})", body_text)
+             or re.search(r'c[Rr]ay["\':\s]*([0-9a-f]{16})', body_text)
+             or re.search(r"cf-ray[^0-9a-f]*([0-9a-f]{16})", body_text))
+        if m:
+            ray = m.group(1)
+        logger.warning("V4W non-JSON response: HTTP %s | ray_id=%s | body[:1500]=%s",
+                       resp.status_code, ray or "(none found)", snippet)
     return parsed, resp
 
 
