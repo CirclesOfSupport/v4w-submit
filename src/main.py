@@ -251,9 +251,71 @@ def submit_to_v4w(fields_values: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 # Gender picklist on the V4W form. If the subscriber value doesn't match exactly,
-# NF stores raw text or nulls it. Default when absent/unmatched:
-GENDER_DEFAULT = "Prefer not to Disclose"
-BRANCH_DEFAULT = "Unknown"
+# NF stores raw text or nulls it. V4W's not-specified picklist option is
+# "Prefer not to disclose" (lowercase d) for BOTH gender and branch — this is the
+# safe default for anything absent or unrecognized. NOTE: "Unknown" is NOT a valid
+# option on the /eatalk-to-us/ form and would be rejected (invalid-option); the
+# safe default must be the exact picklist string below.
+GENDER_DEFAULT = "Prefer not to disclose"
+BRANCH_DEFAULT = "Prefer not to disclose"
+
+# Exact V4W Service Branch dropdown options (from /eatalk-to-us/, 2026-08-17):
+#   Prefer not to disclose | Army | Navy | Air Force | Coast Guard |
+#   Army National Guard | Air National Guard | USMC | Space Force
+# Contact militarybranch is FREE TEXT; observed values are mixed-case and
+# underscore variants. Map a normalized key (lowercased, _/space collapsed) to the
+# exact option. Marine Corps -> USMC (V4W has no "Marine Corps"). Plain
+# "National Guard" has no exact V4W target (they split Army/Air) -> safe default.
+# Anything not in this map -> BRANCH_DEFAULT (strict).
+_BRANCH_MAP = {
+    "army": "Army",
+    "navy": "Navy",
+    "air force": "Air Force",
+    "coast guard": "Coast Guard",
+    "marine corps": "USMC",
+    "marines": "USMC",
+    "usmc": "USMC",
+    "army national guard": "Army National Guard",
+    "air national guard": "Air National Guard",
+    "space force": "Space Force",
+}
+
+# Exact V4W Gender dropdown options (from /eatalk-to-us/, 2026-08-17):
+#   Prefer not to disclose | Male | Female | Non-binary | Transgender female |
+#   Transgender male | Genderqueer | Questioning | Other
+# Contact gender is FREE TEXT. Strict mapping: only clean single-value matches
+# map; multi-values, corrupted, and unrecognized strings -> GENDER_DEFAULT.
+_GENDER_MAP = {
+    "male": "Male",
+    "female": "Female",
+    "non-binary": "Non-binary",
+    "nonbinary": "Non-binary",
+    "transgender female": "Transgender female",
+    "transgender male": "Transgender male",
+    "genderqueer": "Genderqueer",
+    "questioning": "Questioning",
+    "other": "Other",
+}
+
+
+def _norm_key(s: str) -> str:
+    """Lowercase, replace underscores with spaces, collapse whitespace."""
+    return " ".join(s.replace("_", " ").lower().split())
+
+
+def map_branch(raw: str) -> str:
+    """Map a free-text contact branch value to an exact V4W option, else default."""
+    if not raw:
+        return BRANCH_DEFAULT
+    return _BRANCH_MAP.get(_norm_key(raw), BRANCH_DEFAULT)
+
+
+def map_gender(raw: str) -> str:
+    """Map a free-text contact gender value to an exact V4W option, else default.
+    Strict: comma-containing (multi-select) and unrecognized values default."""
+    if not raw or "," in raw:
+        return GENDER_DEFAULT
+    return _GENDER_MAP.get(_norm_key(raw), GENDER_DEFAULT)
 
 
 def normalize_fields(body: dict) -> dict:
@@ -263,8 +325,8 @@ def normalize_fields(body: dict) -> dict:
       name  (full name; split on first space)  OR  fname + lname
       phone (any format; reduced to bare 10 digits)
       zip
-      gender   (optional)
-      branch   (optional; a.k.a. militarybranch)
+      gender   (optional; free text -> mapped to exact V4W option)
+      branch   (optional; a.k.a. militarybranch; free text -> mapped)
     """
     # Name: prefer explicit fname/lname; else split full name on first space.
     fname = (body.get("fname") or "").strip()
@@ -281,8 +343,8 @@ def normalize_fields(body: dict) -> dict:
 
     zipc = str(body.get("zip", "")).strip()
 
-    gender = str(body.get("gender", "")).strip() or GENDER_DEFAULT
-    branch = str(body.get("branch", body.get("militarybranch", ""))).strip() or BRANCH_DEFAULT
+    gender = map_gender(str(body.get("gender", "")).strip())
+    branch = map_branch(str(body.get("branch", body.get("militarybranch", ""))).strip())
 
     return {
         "fname": fname,
@@ -313,7 +375,7 @@ def submit():
         "name": "Jane Doe",          // or "fname"/"lname" separately
         "phone": "+13075551234",     // any format; reduced to 10 digits
         "zip": "85003",
-        "gender": "Female",          // optional; defaults to "Prefer not to Disclose"
+        "gender": "Female",          // optional; defaults to "Prefer not to disclose"
         "branch": "Army"             // optional; defaults to "Unknown"
     }
 
