@@ -21,12 +21,13 @@ PASSWORD = os.environ.get("V4W_SUBMIT_PASSWORD", "")
 # Vets4Warriors Ninja Forms endpoint + form contract
 # ---------------------------------------------------------------------------
 # The form V4W stood up for Early Alert (2026-07-30): Ninja Forms, WordPress.
-#   Public page:  https://vets4warriors.com/ninja-forms/383pwa/
+#   Public page:  https://vets4warriors.com/eatalk-to-us/  (Request a call form)
 #   Submit route: POST https://vets4warriors.com/wp-admin/admin-ajax.php
 #                 action=nf_ajax_submit
-#   Form id:      "38"  (rendered instance id is "38_1" — MUST be sent as 38_1,
-#                 with all field keys _1-suffixed, or NF's instance-fix drops the
-#                 first field's value and returns a spurious required-error)
+#   Form id:      "38"  (the /eatalk-to-us/ page renders the BASE instance:
+#                 id "38", base-id field keys ("453"), integer inner ids. The
+#                 earlier /383pwa/ page rendered the "38_1" instance. The envelope
+#                 MUST match whatever instance the target page renders.)
 #
 # NONCE: NF validates a WordPress nonce (param "security"). A stateless caller
 # has no browser session to scrape a fresh nonce, BUT the controller implements
@@ -44,7 +45,7 @@ PASSWORD = os.environ.get("V4W_SUBMIT_PASSWORD", "")
 NF_SUBMIT_URL = os.environ.get(
     "NF_SUBMIT_URL", "https://vets4warriors.com/wp-admin/admin-ajax.php"
 )
-NF_FORM_INSTANCE_ID = "38_1"
+NF_FORM_INSTANCE_ID = "38"
 
 # Static consent HTML display fields (exact strings the real form emits). NF
 # echoes these back as field values on a genuine browser submit; they are
@@ -90,29 +91,38 @@ def build_form_data(fields_values: dict) -> str:
 
     Returns the JSON string (NOT url-encoded — caller url-encodes when placing
     it in the form-urlencoded body).
+
+    NOTE on instance: the final page (/eatalk-to-us/) renders NF form 38 as the
+    BASE instance — form id "38", field keys are base ids ("453", not "453_1"),
+    and the inner "id" is an INTEGER (453), not a string. This differs from the
+    earlier /ninja-forms/383pwa/ page, which rendered the "_1" instance
+    (id "38_1", keys "453_1", inner id "453_1"). The envelope MUST match whatever
+    instance the target page renders; verified against the 2026-08-14 DevTools
+    capture of /eatalk-to-us/ (ZZTestF09, HTTP 200).
     """
     def f(fid, value):
+        # inner id is an integer, matching the /eatalk-to-us/ capture
         return {"value": value, "id": fid}
 
     fields = {
-        "453_1": f("453_1", fields_values["fname"]),
-        "454_1": f("454_1", fields_values["lname"]),
-        "451_1": f("451_1", ""),                      # email (not sent)
-        "455_1": f("455_1", fields_values["phone"]),
-        "456_1": f("456_1", fields_values["zip"]),
-        "457_1": f("457_1", fields_values["gender"]),
-        "458_1": f("458_1", fields_values["branch"]),
-        "459_1": {"value": [], "id": "459_1"},        # Era (multiselect) -> []
-        "460_1": f("460_1", "Did not obtain"),        # Duty status
-        "462_1": {"value": 1, "id": "462_1"},         # permission to call mobile (required)
-        "466_1": f("466_1", _HTML_PHONE),
-        "461_1": {"value": 1, "id": "461_1"},         # permission to leave a message
-        "463_1": {"value": 0, "id": "463_1"},         # permission to email
-        "467_1": f("467_1", _HTML_EMAIL),
-        "464_1": {"value": 0, "id": "464_1"},         # permission to text mobile
-        "468_1": f("468_1", _HTML_TEXT),
-        "465_1": f("465_1", _HTML_TOS),
-        "452_1": f("452_1", ""),                      # submit field
+        "451": f(451, ""),                       # email (not sent)
+        "452": f(452, ""),                       # submit field
+        "453": f(453, fields_values["fname"]),
+        "454": f(454, fields_values["lname"]),
+        "455": f(455, fields_values["phone"]),
+        "456": f(456, fields_values["zip"]),
+        "457": f(457, fields_values["gender"]),
+        "458": f(458, fields_values["branch"]),
+        "459": {"value": [], "id": 459},         # Era (multiselect) -> []
+        "460": f(460, "Did not obtain"),         # Duty status
+        "461": {"value": 1, "id": 461},          # permission to leave a message
+        "462": {"value": 1, "id": 462},          # permission to call mobile (required)
+        "463": {"value": 0, "id": 463},          # permission to email
+        "464": {"value": 0, "id": 464},          # permission to text mobile
+        "465": f(465, _HTML_TOS),
+        "466": f(466, _HTML_PHONE),
+        "467": f(467, _HTML_EMAIL),
+        "468": f(468, _HTML_TEXT),
     }
     envelope = {"id": NF_FORM_INSTANCE_ID, "fields": fields, "extra": {}}
     return json.dumps(envelope, ensure_ascii=False)
@@ -136,7 +146,7 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
         headers={
             "User-Agent": UA,
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://vets4warriors.com/ninja-forms/383pwa/",
+            "Referer": "https://vets4warriors.com/eatalk-to-us/",
         },
         timeout=NF_TIMEOUT,
     )
