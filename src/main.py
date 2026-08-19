@@ -424,7 +424,16 @@ def submit():
     if not result["success"] and is_403_detail(result["detail"]):
         logger.warning("V4W 403 on /submit for uuid=%s — enqueuing retry",
                        body.get("uuid"))
-        enqueue_retry(body, attempt=1)
+        # Isolate the enqueue from the response path: the TextIt response below
+        # MUST return clean (success=false + 403 detail) regardless of whether
+        # the Cloud Tasks enqueue succeeds. A failure here means only "retry not
+        # queued" (logged) — never a 500 back to the flow (which would trip the
+        # flow's transport-retry loop and cause a DUPLICATE V4W post).
+        try:
+            enqueue_retry(body, attempt=1)
+        except Exception:
+            logger.exception("enqueue_retry failed for uuid=%s — retry NOT queued; "
+                             "returning clean 403 response to caller", body.get("uuid"))
 
     if not result["success"]:
         logger.error("V4W submission failed: %s | fields=%s",
@@ -481,9 +490,18 @@ def retry():
     if is_403_detail(result["detail"]) and attempt + 1 < MAX_ATTEMPTS:
         logger.warning("V4W retry attempt=%s 403 for uuid=%s — enqueuing next",
                        attempt, uuid_value)
-        enqueue_retry(body, attempt=attempt + 1)
-        return jsonify({"status": "retrying", "success": False,
-                        "attempt": attempt}), 200
+        # If the re-enqueue succeeds, return "retrying" and let the next task
+        # resolve it. If it FAILS, do not silently drop the referral — fall
+        # through to logging Retry=FAIL so the failure is at least visible in
+        # the sheet (better a FAIL row than a vanished referral).
+        try:
+            if enqueue_retry(body, attempt=attempt + 1):
+                return jsonify({"status": "retrying", "success": False,
+                                "attempt": attempt}), 200
+            logger.error("re-enqueue returned False (no queue?) uuid=%s — logging FAIL",
+                         uuid_value)
+        except Exception:
+            logger.exception("re-enqueue threw uuid=%s — logging FAIL", uuid_value)
 
     logger.error("V4W retry FINAL FAIL attempt=%s uuid=%s detail=%s",
                  attempt, uuid_value, result["detail"])
