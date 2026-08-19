@@ -1,10 +1,12 @@
 import os
+import re
 import json
 import logging
-import urllib.parse
+import datetime
 
 import requests
 from flask import Flask, request, jsonify
+from google.cloud import tasks_v2
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -14,43 +16,22 @@ logger = logging.getLogger(__name__)
 # Auth
 # ---------------------------------------------------------------------------
 # Shared-secret password, same convention as sheet-service. Set via env var;
-# never hardcoded (these repos are PUBLIC).
+# never hardcoded (these repos are PUBLIC). The SAME shared secret authenticates
+# both this service's endpoints AND the sheet-service /write call (the TextIt
+# global @globals.gappscriptapi is used for both).
 PASSWORD = os.environ.get("V4W_SUBMIT_PASSWORD", "")
 
 # ---------------------------------------------------------------------------
 # Vets4Warriors Ninja Forms endpoint + form contract
 # ---------------------------------------------------------------------------
-# The form V4W stood up for Early Alert (2026-07-30): Ninja Forms, WordPress.
-#   Public page:  https://vets4warriors.com/eatalk-to-us/  (Request a call form)
-#   Submit route: POST https://vets4warriors.com/wp-admin/admin-ajax.php
-#                 action=nf_ajax_submit
-#   Form id:      "38"  (the /eatalk-to-us/ page renders the BASE instance:
-#                 id "38", base-id field keys ("453"), integer inner ids. The
-#                 earlier /383pwa/ page rendered the "38_1" instance. The envelope
-#                 MUST match whatever instance the target page renders.)
-#
-# NONCE: NF validates a WordPress nonce (param "security"). A stateless caller
-# has no browser session to scrape a fresh nonce, BUT the controller implements
-# a "Just-in-Time" nonce path: POST with an invalid nonce and NF returns
-# HTTP 200 with body {"errors":{"nonce":{"new_nonce":"...","nonce_ts":...}}}.
-# Re-POST with security=new_nonce & nonce_ts=<ts> and the submission goes
-# through — no cookies, no prior GET required. Confirmed 2026-08-14 (sub_id
-# 813796 created via two stateless POSTs). This service performs both POSTs
-# back-to-back, so the nonce is always seconds old.
-#
-# SUCCESS: NF returns HTTP 200 on BOTH the nonce-retry AND real success, so the
-# HTTP status cannot distinguish them. Success is identified by the BODY:
-# data.actions.save.sub_id present and errors empty/absent.
+# See repo history / Atlas itdo_377_vets4warriors.md for the full NF mechanism
+# writeup (JiT nonce, base instance "38", body-distinguishable success).
 
 NF_SUBMIT_URL = os.environ.get(
     "NF_SUBMIT_URL", "https://vets4warriors.com/wp-admin/admin-ajax.php"
 )
 NF_FORM_INSTANCE_ID = "38"
 
-# Static consent HTML display fields (exact strings the real form emits). NF
-# echoes these back as field values on a genuine browser submit; they are
-# display-only ("html" field type) but are included to match the known-good
-# wire payload byte-for-byte.
 _HTML_PHONE = ("<p>I agree to receive phone calls from Vets4Warriors on my mobile "
                "device. Mobile and data charges may apply.</p>")
 _HTML_EMAIL = ("<p>I agree to receive emails from Vets4Warriors. I can opt out at "
@@ -62,12 +43,48 @@ _HTML_TEXT = ("<p>I agree to receive text messages from Vets4Warriors. Message "
 _HTML_TOS = ('<p><a href="https://vets4warriors.com/privacy-policy/" rel="noopener '
              'noreferrer" target="_blank">Terms of Service and Privacy Policy</a></p>')
 
-# Request/connect timeouts (seconds) for each leg to V4W.
 NF_TIMEOUT = (10, 30)
 
-# Default UA — some WAF configs reject empty/scripted UAs.
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/127.0 Safari/537.36")
+
+# ---------------------------------------------------------------------------
+# Cloud Tasks — delayed retry on a Cloudflare 403
+# ---------------------------------------------------------------------------
+# A 403 from V4W is a Cloudflare block on Cloud Run's rotating egress IP — it is
+# NON-terminal: the same post resent minutes later rides a different pooled IP
+# and typically passes. On a 403, /submit enqueues a Cloud Task that re-calls
+# /retry after RETRY_DELAY_SECONDS; /retry re-attempts and, if it 403s again,
+# enqueues the next retry until MAX_ATTEMPTS is reached. If TASKS_QUEUE is unset
+# the enqueue is skipped and logged (service still runs, just with no retry).
+TASKS_QUEUE = os.environ.get("TASKS_QUEUE", "")
+TASKS_LOCATION = os.environ.get("TASKS_LOCATION", "us-east1")
+TASKS_PROJECT = os.environ.get("TASKS_PROJECT", "early-alert-responses")
+SERVICE_URL = os.environ.get(
+    "SERVICE_URL", "https://v4w-submit-853176470965.us-east1.run.app"
+)
+RETRY_DELAY_SECONDS = int(os.environ.get("RETRY_DELAY_SECONDS", "300"))  # ~5 min
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))  # 1 initial + 2 retries
+
+# ---------------------------------------------------------------------------
+# sheet-service /write — referral logging (retry-recovered + final-fail only)
+# ---------------------------------------------------------------------------
+# The happy path (immediate success) is logged by the TextIt flow itself. This
+# service writes the Referrals row ONLY for cases the flow can't see because it
+# has ended on the 403 branch: a retry that SUCCEEDS, or one that FAILS after
+# MAX_ATTEMPTS. Row matches the flow's /write node (uuid / timestamp / provider)
+# plus the Retry column: "SUCCESS" | "FAIL". Happy path leaves Retry blank.
+SHEET_WRITE_URL = os.environ.get(
+    "SHEET_WRITE_URL", "https://sheet-service-853176470965.us-east1.run.app/write"
+)
+SHEET_ID = os.environ.get("SHEET_ID", "1CquixL95khVlhSrzWjSGetAevFX2-_kl2RgjFe0Q1hI")
+SHEET_TAB = os.environ.get("SHEET_TAB", "Referrals")
+SHEET_TIMEOUT = (10, 30)
+
+
+def is_403_detail(detail: str) -> bool:
+    """True if a submit result detail is the Cloudflare-403 block case."""
+    return bool(detail) and "403" in detail
 
 
 def check_password(body: dict) -> bool:
@@ -75,8 +92,6 @@ def check_password(body: dict) -> bool:
 
 
 def parse_body_or_400():
-    """Parse JSON body, distinguishing unparseable from empty (sheet-service
-    pattern — a malformed body must 400, not masquerade as a 403)."""
     body = request.get_json(force=True, silent=True)
     if body is None:
         return {}, (jsonify({"status": "error", "message": "Invalid JSON"}), 400)
@@ -84,41 +99,25 @@ def parse_body_or_400():
 
 
 def build_form_data(fields_values: dict) -> str:
-    """Build the NF formData JSON envelope from resolved subscriber values.
-
-    fields_values keys: fname, lname, phone, zip, gender, branch (all strings;
-    caller has already defaulted/normalized them).
-
-    Returns the JSON string (NOT url-encoded — caller url-encodes when placing
-    it in the form-urlencoded body).
-
-    NOTE on instance: the final page (/eatalk-to-us/) renders NF form 38 as the
-    BASE instance — form id "38", field keys are base ids ("453", not "453_1"),
-    and the inner "id" is an INTEGER (453), not a string. This differs from the
-    earlier /ninja-forms/383pwa/ page, which rendered the "_1" instance
-    (id "38_1", keys "453_1", inner id "453_1"). The envelope MUST match whatever
-    instance the target page renders; verified against the 2026-08-14 DevTools
-    capture of /eatalk-to-us/ (ZZTestF09, HTTP 200).
-    """
+    """Build the NF formData JSON envelope from resolved subscriber values."""
     def f(fid, value):
-        # inner id is an integer, matching the /eatalk-to-us/ capture
         return {"value": value, "id": fid}
 
     fields = {
-        "451": f(451, ""),                       # email (not sent)
-        "452": f(452, ""),                       # submit field
+        "451": f(451, ""),
+        "452": f(452, ""),
         "453": f(453, fields_values["fname"]),
         "454": f(454, fields_values["lname"]),
         "455": f(455, fields_values["phone"]),
         "456": f(456, fields_values["zip"]),
         "457": f(457, fields_values["gender"]),
         "458": f(458, fields_values["branch"]),
-        "459": {"value": [], "id": 459},         # Era (multiselect) -> []
-        "460": f(460, "Did not obtain"),         # Duty status
-        "461": {"value": 1, "id": 461},          # permission to leave a message
-        "462": {"value": 1, "id": 462},          # permission to call mobile (required)
-        "463": {"value": 0, "id": 463},          # permission to email
-        "464": {"value": 0, "id": 464},          # permission to text mobile
+        "459": {"value": [], "id": 459},
+        "460": f(460, "Did not obtain"),
+        "461": {"value": 1, "id": 461},
+        "462": {"value": 1, "id": 462},
+        "463": {"value": 0, "id": 463},
+        "464": {"value": 0, "id": 464},
         "465": f(465, _HTML_TOS),
         "466": f(466, _HTML_PHONE),
         "467": f(467, _HTML_EMAIL),
@@ -128,9 +127,7 @@ def build_form_data(fields_values: dict) -> str:
     return json.dumps(envelope, ensure_ascii=False)
 
 
-def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
-    """POST the NF envelope once. Returns the parsed JSON body (dict) and the
-    raw requests.Response. formData is url-encoded here (form-urlencoded body)."""
+def _nf_post(form_data_json: str, security: str, nonce_ts):
     payload = {
         "action": "nf_ajax_submit",
         "security": security,
@@ -142,7 +139,7 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
 
     resp = requests.post(
         NF_SUBMIT_URL,
-        data=payload,  # requests url-encodes form fields, incl. the formData JSON
+        data=payload,
         headers={
             "User-Agent": UA,
             "X-Requested-With": "XMLHttpRequest",
@@ -154,17 +151,8 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
         parsed = resp.json()
     except ValueError:
         parsed = None
-        # Non-JSON response (e.g. a WAF/bot-protection HTML block page). Log the
-        # status + body so the blocker is identifiable (Cloudflare block pages
-        # carry a "Ray ID" that V4W's Cloudflare admin can look up to see which
-        # rule fired). 1500 chars is enough to reach the Ray ID / cf-ray marker
-        # which sits well below the truncated 300. Body is V4W's, not subscriber PII.
         body_text = resp.text or ""
         snippet = body_text[:1500].replace("\n", " ")
-        # Best-effort: pull the Cloudflare Ray ID out explicitly so it's greppable.
-        # CF Ray IDs are 16 hex chars. Match the label forms and the JS challenge
-        # (cRay) form; the full body is logged below regardless, so this is a
-        # convenience, not load-bearing.
         ray = ""
         m = (re.search(r"[Rr]ay ID:\s*(?:<[^>]*>\s*)*([0-9a-f]{16})", body_text)
              or re.search(r'c[Rr]ay["\':\s]*([0-9a-f]{16})', body_text)
@@ -177,15 +165,6 @@ def _nf_post(form_data_json: str, security: str, nonce_ts: str | None):
 
 
 def _extract_sub_id(parsed: dict):
-    """Pull data.actions.save.sub_id, tolerating NF's shape variation.
-
-    On a genuine success NF returns data as an OBJECT:
-      {"data":{"actions":{"save":{"sub_id":813796}}}, ...}
-    On the nonce-retry (and some error) responses NF returns data as an empty
-    LIST:  {"data":[], "errors":{...}}.  Calling .get() on that list raises
-    AttributeError, which is what produced the 500. Guard every hop: if any
-    level isn't a dict, there's no sub_id.
-    """
     data = parsed.get("data")
     if not isinstance(data, dict):
         return None
@@ -199,15 +178,10 @@ def _extract_sub_id(parsed: dict):
 
 
 def submit_to_v4w(fields_values: dict) -> dict:
-    """Full two-POST JiT-nonce submission. Returns a normalized result dict:
-      {"success": bool, "sub_id": <str|None>, "detail": <str>}
-    Never raises for a V4W-side rejection — those come back as success=False
-    with detail. Raises only on transport failure (caller maps to 502)."""
-
+    """Full two-POST JiT-nonce submission. Returns normalized result dict:
+      {"success": bool, "sub_id": <str|None>, "detail": <str>}"""
     form_data_json = build_form_data(fields_values)
 
-    # PII-safe request marker: never log the full phone (veteran PII). Last 4
-    # is enough to correlate a run with the TextIt httplog / a V4W record.
     phone = fields_values.get("phone", "")
     phone_tail = phone[-4:] if len(phone) >= 4 else phone
     logger.info("V4W submit start: name=%s %s zip=%s phone=...%s gender=%s branch=%s",
@@ -215,21 +189,18 @@ def submit_to_v4w(fields_values: dict) -> dict:
                 fields_values.get("zip"), phone_tail,
                 fields_values.get("gender"), fields_values.get("branch"))
 
-    # POST 1: intentionally invalid nonce to trigger the JiT nonce response.
     p1, r1 = _nf_post(form_data_json, security="0", nonce_ts=None)
 
     if p1 is None:
         return {"success": False, "sub_id": None,
                 "detail": f"POST1 non-JSON response (HTTP {r1.status_code})"}
 
-    # If POST1 somehow already succeeded (nonce happened to validate), take it.
     sub_id = _extract_sub_id(p1)
     if sub_id:
         return {"success": True, "sub_id": str(sub_id), "detail": "created on POST1"}
 
     nonce_block = (p1.get("errors", {}) or {}).get("nonce")
     if not nonce_block or not nonce_block.get("new_nonce"):
-        # No JiT nonce came back and no success — a real validation/other error.
         return {"success": False, "sub_id": None,
                 "detail": f"POST1 no JiT nonce; errors={json.dumps(p1.get('errors'))}"}
 
@@ -237,7 +208,6 @@ def submit_to_v4w(fields_values: dict) -> dict:
     nonce_ts = str(nonce_block.get("nonce_ts", ""))
     logger.info("V4W POST1 returned JiT nonce (ts=%s); retrying", nonce_ts)
 
-    # POST 2: resubmit with the JiT nonce.
     p2, r2 = _nf_post(form_data_json, security=new_nonce, nonce_ts=nonce_ts)
 
     if p2 is None:
@@ -249,7 +219,6 @@ def submit_to_v4w(fields_values: dict) -> dict:
         logger.info("V4W submit success: sub_id=%s (POST2)", sub_id)
         return {"success": True, "sub_id": str(sub_id), "detail": "created on POST2"}
 
-    # Still no sub_id: surface whatever NF said (field errors, nonce loop, etc.)
     errors = p2.get("errors")
     if errors and errors.get("nonce"):
         return {"success": False, "sub_id": None,
@@ -259,28 +228,86 @@ def submit_to_v4w(fields_values: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Retry orchestration (Cloud Tasks) + referral logging
+# ---------------------------------------------------------------------------
+
+def enqueue_retry(payload: dict, attempt: int) -> bool:
+    """Enqueue a Cloud Task to call /retry after RETRY_DELAY_SECONDS. payload is
+    the full inbound /submit body (fields + uuid). attempt = the retry number the
+    /retry invocation represents (1 = first retry). Returns True if enqueued."""
+    if not TASKS_QUEUE:
+        logger.error("TASKS_QUEUE unset — cannot enqueue retry (attempt=%s). "
+                     "403 will NOT be retried for uuid=%s.",
+                     attempt, payload.get("uuid"))
+        return False
+
+    client = tasks_v2.CloudTasksClient()
+    parent = client.queue_path(TASKS_PROJECT, TASKS_LOCATION, TASKS_QUEUE)
+
+    task_body = dict(payload)
+    task_body["attempt"] = attempt
+
+    schedule_time = (
+        datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(seconds=RETRY_DELAY_SECONDS)
+    )
+    ts = tasks_v2.types.Timestamp()
+    ts.FromDatetime(schedule_time)
+
+    task = {
+        "http_request": {
+            "http_method": tasks_v2.HttpMethod.POST,
+            "url": f"{SERVICE_URL}/retry",
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps(task_body).encode(),
+        },
+        "schedule_time": ts,
+    }
+    client.create_task(request={"parent": parent, "task": task})
+    logger.info("Enqueued retry attempt=%s for uuid=%s in %ss",
+                attempt, payload.get("uuid"), RETRY_DELAY_SECONDS)
+    return True
+
+
+def log_referral_row(uuid_value: str, retry_status: str) -> bool:
+    """Write a Referrals row via sheet-service /write. Matches the flow's write
+    node (uuid / timestamp / provider) plus Retry. Timestamp = write time
+    (retry-success or final-fail moment) — the decided source of truth."""
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d, %H:%M")
+    body = {
+        "password": PASSWORD,
+        "sheetid": SHEET_ID,
+        "tab": SHEET_TAB,
+        "newrow": "yes",
+        "key": "uuid",
+        "uuid": uuid_value,
+        "timestamp": now_str,
+        "provider": "Vets4Warriors",
+        "Retry": retry_status,
+    }
+    try:
+        r = requests.post(SHEET_WRITE_URL, json=body, timeout=SHEET_TIMEOUT)
+        ok = r.status_code == 200
+        if not ok:
+            logger.error("sheet /write failed: HTTP %s | uuid=%s | retry=%s | body=%s",
+                         r.status_code, uuid_value, retry_status, r.text[:300])
+        else:
+            logger.info("Logged Referrals row: uuid=%s Retry=%s", uuid_value, retry_status)
+        return ok
+    except requests.RequestException:
+        logger.exception("sheet /write transport error: uuid=%s retry=%s",
+                         uuid_value, retry_status)
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Field normalization
 # ---------------------------------------------------------------------------
 
-# Gender picklist on the V4W form. If the subscriber value doesn't match exactly,
-# CRITICAL: NF option VALUES differ from displayed LABELS. These are the exact
-# <option value="..."> strings extracted from the /eatalk-to-us/ dropdowns via
-# DevTools (2026-08-17) — NOT the visible labels. Using labels gets invalid-option
-# rejections. Notable divergences: gender not-disclose VALUE is "Prefer not to
-# Disclose" (capital D) though it displays lowercase; gender "Questioning" VALUE is
-# "Not sure what their gender identity is (Questioning)"; branch not-disclose VALUE
-# is "Unknown" (not the "Prefer not to disclose" label); duty not-disclose VALUE is
-# "Did not obtain".
-GENDER_DEFAULT = "Prefer not to Disclose"   # capital D — verified option VALUE
-BRANCH_DEFAULT = "Unknown"                  # verified option VALUE (label says "Prefer not to disclose")
-DUTY_DEFAULT = "Did not obtain"             # verified option VALUE
+GENDER_DEFAULT = "Prefer not to Disclose"
+BRANCH_DEFAULT = "Unknown"
+DUTY_DEFAULT = "Did not obtain"
 
-# Contact militarybranch is FREE TEXT; observed values are mixed-case and
-# underscore variants (Army/army, Air Force/air_force, Marine Corps/marine_corps,
-# etc.). Map a normalized key (lowercased, _/space collapsed) to the exact option
-# VALUE. Marine Corps -> USMC (V4W has no "Marine Corps"). Plain "National Guard"
-# has no exact V4W target (they split Army/Air) -> safe default. Unrecognized ->
-# BRANCH_DEFAULT (strict).
 _BRANCH_MAP = {
     "army": "Army",
     "navy": "Navy",
@@ -294,9 +321,6 @@ _BRANCH_MAP = {
     "space force": "Space Force",
 }
 
-# Contact gender is FREE TEXT. Strict mapping to exact option VALUES: only clean
-# single-value matches map; multi-values (comma), corrupted, and unrecognized
-# strings -> GENDER_DEFAULT. Note "Questioning" maps to the long option value.
 _GENDER_MAP = {
     "male": "Male",
     "female": "Female",
@@ -311,36 +335,22 @@ _GENDER_MAP = {
 
 
 def _norm_key(s: str) -> str:
-    """Lowercase, replace underscores with spaces, collapse whitespace."""
     return " ".join(s.replace("_", " ").lower().split())
 
 
 def map_branch(raw: str) -> str:
-    """Map a free-text contact branch value to an exact V4W option, else default."""
     if not raw:
         return BRANCH_DEFAULT
     return _BRANCH_MAP.get(_norm_key(raw), BRANCH_DEFAULT)
 
 
 def map_gender(raw: str) -> str:
-    """Map a free-text contact gender value to an exact V4W option, else default.
-    Strict: comma-containing (multi-select) and unrecognized values default."""
     if not raw or "," in raw:
         return GENDER_DEFAULT
     return _GENDER_MAP.get(_norm_key(raw), GENDER_DEFAULT)
 
 
 def normalize_fields(body: dict) -> dict:
-    """Resolve the flat inbound body into the NF field values.
-
-    Inbound (from TextIt, clean JSON):
-      name  (full name; split on first space)  OR  fname + lname
-      phone (any format; reduced to bare 10 digits)
-      zip
-      gender   (optional; free text -> mapped to exact V4W option)
-      branch   (optional; a.k.a. militarybranch; free text -> mapped)
-    """
-    # Name: prefer explicit fname/lname; else split full name on first space.
     fname = (body.get("fname") or "").strip()
     lname = (body.get("lname") or "").strip()
     if not fname and body.get("name"):
@@ -348,7 +358,6 @@ def normalize_fields(body: dict) -> dict:
         fname = parts[0]
         lname = parts[1] if len(parts) > 1 else ""
 
-    # Phone: strip to the last 10 digits (NF phone field expects bare 10-digit).
     raw_phone = str(body.get("phone", ""))
     digits = "".join(ch for ch in raw_phone if ch.isdigit())
     phone = digits[-10:] if len(digits) >= 10 else digits
@@ -381,27 +390,10 @@ def health():
 def submit():
     """Submit a callback request to the Vets4Warriors Ninja Forms endpoint.
 
-    Request body (JSON):
-    {
-        "password": "...",
-        "name": "Jane Doe",          // or "fname"/"lname" separately
-        "phone": "+13075551234",     // any format; reduced to 10 digits
-        "zip": "85003",
-        "gender": "Female",          // optional; defaults to "Prefer not to disclose"
-        "branch": "Army"             // optional; defaults to "Unknown"
-    }
-
-    Response (always HTTP 200 unless auth/transport fails):
-    {
-        "status": "success",
-        "success": true,
-        "sub_id": "813796",
-        "detail": "created on POST2"
-    }
-
-    On a V4W-side rejection: HTTP 200, success=false, detail carries the cause.
-    On bad auth: 403. On transport failure to V4W: 502.
-    """
+    Body adds "uuid" (contact uuid) so a retry-recovered or final-fail Referrals
+    row can be logged by this service (the flow logs the immediate-success row).
+    On a Cloudflare 403: success=false, detail contains "403", AND a delayed
+    retry is enqueued (the flow routes 403 -> info email -> ends)."""
     body, err = parse_body_or_400()
     if err:
         return err
@@ -411,7 +403,6 @@ def submit():
 
     fields_values = normalize_fields(body)
 
-    # Minimal required-field guard (NF requires first/last/phone/zip + call perm).
     missing = [k for k in ("fname", "phone", "zip") if not fields_values.get(k)]
     if missing:
         return jsonify({
@@ -430,8 +421,12 @@ def submit():
         return jsonify({"status": "error", "success": False,
                         "message": f"internal error: {e}"}), 500
 
+    if not result["success"] and is_403_detail(result["detail"]):
+        logger.warning("V4W 403 on /submit for uuid=%s — enqueuing retry",
+                       body.get("uuid"))
+        enqueue_retry(body, attempt=1)
+
     if not result["success"]:
-        # Log loudly — this is the case that must be visible when it fails.
         logger.error("V4W submission failed: %s | fields=%s",
                      result["detail"],
                      {k: fields_values[k] for k in ("fname", "lname", "zip")})
@@ -442,6 +437,59 @@ def submit():
         "sub_id": result["sub_id"],
         "detail": result["detail"],
     }), 200
+
+
+@app.route("/retry", methods=["POST"])
+def retry():
+    """Cloud-Tasks-invoked delayed retry of a 403-blocked submission.
+
+    Body = original /submit body + "attempt" (1-based). SUCCESS -> log
+    Retry="SUCCESS". 403 again with attempts left -> enqueue next. 403 with no
+    attempts left, or any non-403 failure -> log Retry="FAIL". Returns 200 on
+    handled outcomes so the queue does not add its own retry on top."""
+    body, err = parse_body_or_400()
+    if err:
+        return err
+
+    if not check_password(body):
+        return jsonify({"status": "error", "message": "Unauthorized"}), 403
+
+    attempt = int(body.get("attempt", 1))
+    uuid_value = body.get("uuid", "")
+
+    fields_values = normalize_fields(body)
+    missing = [k for k in ("fname", "phone", "zip") if not fields_values.get(k)]
+    if missing:
+        logger.error("retry missing fields %s for uuid=%s — logging FAIL",
+                     missing, uuid_value)
+        log_referral_row(uuid_value, "FAIL")
+        return jsonify({"status": "error", "message": "missing fields"}), 200
+
+    try:
+        result = submit_to_v4w(fields_values)
+    except Exception:
+        logger.exception("retry attempt=%s errored for uuid=%s", attempt, uuid_value)
+        result = {"success": False, "sub_id": None, "detail": "retry transport error"}
+
+    if result["success"]:
+        logger.info("V4W retry attempt=%s SUCCEEDED for uuid=%s (sub_id=%s)",
+                    attempt, uuid_value, result["sub_id"])
+        log_referral_row(uuid_value, "SUCCESS")
+        return jsonify({"status": "success", "success": True,
+                        "sub_id": result["sub_id"], "attempt": attempt}), 200
+
+    if is_403_detail(result["detail"]) and attempt + 1 < MAX_ATTEMPTS:
+        logger.warning("V4W retry attempt=%s 403 for uuid=%s — enqueuing next",
+                       attempt, uuid_value)
+        enqueue_retry(body, attempt=attempt + 1)
+        return jsonify({"status": "retrying", "success": False,
+                        "attempt": attempt}), 200
+
+    logger.error("V4W retry FINAL FAIL attempt=%s uuid=%s detail=%s",
+                 attempt, uuid_value, result["detail"])
+    log_referral_row(uuid_value, "FAIL")
+    return jsonify({"status": "error", "success": False,
+                    "detail": result["detail"], "attempt": attempt}), 200
 
 
 # ---------------------------------------------------------------------------
