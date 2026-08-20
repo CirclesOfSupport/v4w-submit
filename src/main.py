@@ -7,6 +7,7 @@ import datetime
 import requests
 from flask import Flask, request, jsonify
 from google.cloud import tasks_v2
+from google.protobuf import timestamp_pb2
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -251,7 +252,7 @@ def enqueue_retry(payload: dict, attempt: int) -> bool:
         datetime.datetime.now(tz=datetime.timezone.utc)
         + datetime.timedelta(seconds=RETRY_DELAY_SECONDS)
     )
-    ts = tasks_v2.types.Timestamp()
+    ts = timestamp_pb2.Timestamp()
     ts.FromDatetime(schedule_time)
 
     task = {
